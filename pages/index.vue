@@ -1,30 +1,31 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { useDebounceFn } from '@vueuse/core'
+import { useRouter } from 'vue-router' // 🌟 新增 router
 
 const supabase = useSupabaseClient()
+const router = useRouter() // 🌟 宣告 router
 
 const content = ref('')
 const isSaving = ref(false)
 const lastSavedTime = ref(null)
 
-// 產生這次輸入專屬的 ID (重新整理就會產生新的，確保每次都是新紀錄)
+// 產生這次輸入專屬的 ID (重新整理就會產生新的)
 const sessionId = ref('')
 const today = new Date().toISOString().split('T')[0]
 
 onMounted(() => {
-  // 網頁載入時，發配一個全新的 UUID 給這次的紀錄
   sessionId.value = crypto.randomUUID()
 })
 
-// 自動存檔邏輯 (針對目前的 sessionId 進行更新)
+// 自動存檔邏輯
 const saveToSupabase = async (newContent) => {
   if (!newContent || !newContent.trim()) return
 
   isSaving.value = true
   
   await supabase.from('counseling_logs').upsert({ 
-    id: sessionId.value, // 指定 ID，確保打字停頓時是更新同一筆，而不是一直新增
+    id: sessionId.value, 
     record_date: today,
     content: newContent,
     updated_at: new Date().toISOString()
@@ -34,7 +35,6 @@ const saveToSupabase = async (newContent) => {
   lastSavedTime.value = new Date().toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' })
 }
 
-// 防抖：停止語音聽寫 1.5 秒後自動存檔
 const autoSave = useDebounceFn((newVal) => {
   saveToSupabase(newVal)
 }, 1500)
@@ -52,11 +52,38 @@ const copyContent = async () => {
   }
 }
 
-// 寫完一筆，想要立刻寫下一筆的按鈕
 const startNewRecord = () => {
   content.value = ''
-  sessionId.value = crypto.randomUUID() // 重新發配新 ID
+  sessionId.value = crypto.randomUUID()
   lastSavedTime.value = null
+}
+
+// ==========================================
+// 🌟 新增：動態密碼驗證功能
+// ==========================================
+const goToHistory = () => {
+  const d = new Date()
+  
+  // 取得西元年後兩碼 (例如 2026 -> "26")
+  const yy = String(d.getFullYear()).slice(-2)
+  // 取得月份，並補零 (例如 7 -> "07")
+  const mm = String(d.getMonth() + 1).padStart(2, '0')
+  // 取得日期，並補零 (例如 12 -> "12")
+  const dd = String(d.getDate()).padStart(2, '0')
+  
+  // 組合當日動態密碼 (例如 26071259)
+  const dynamicPassword = `${yy}${mm}${dd}59`
+
+  // 彈出輸入框 (乾淨無提示)
+  const userInput = prompt('請輸入密碼：')
+  
+  if (userInput === dynamicPassword) {
+    // 密碼正確，跳轉至歷史紀錄頁面
+    router.push('/history')
+  } else if (userInput !== null) { 
+    // 若使用者輸入錯誤 (且不是按取消)
+    alert('密碼錯誤')
+  }
 }
 </script>
 
@@ -66,9 +93,14 @@ const startNewRecord = () => {
     <div class="flex justify-between items-end mb-4 px-1">
       <div>
         <h1 class="text-2xl font-bold text-gray-800 tracking-wide mb-1">新增輔導日誌</h1>
-        <NuxtLink to="/history" class="text-sm bg-blue-100 text-blue-700 px-3 py-1.5 rounded-lg font-bold shadow-sm active:bg-blue-200">
+        
+        <button 
+          @click="goToHistory" 
+          class="text-sm bg-blue-100 text-blue-700 px-3 py-1.5 rounded-lg font-bold shadow-sm active:bg-blue-200 transition-colors"
+        >
           📂 前往歷史紀錄
-        </NuxtLink>
+        </button>
+
       </div>
       <span class="text-xs font-medium text-gray-400 mb-1">
         {{ isSaving ? '儲存中...' : (lastSavedTime ? `${lastSavedTime} 已存檔` : '') }}
@@ -94,3 +126,10 @@ const startNewRecord = () => {
     
   </div>
 </template>
+
+<style scoped>
+/* 避免 iOS Safari 在輸入時畫面亂跳 */
+textarea {
+  font-size: 16px !important;
+}
+</style>
