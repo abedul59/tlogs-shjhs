@@ -1,10 +1,10 @@
 <script setup>
 import { ref, watch, onMounted } from 'vue'
 import { useDebounceFn } from '@vueuse/core'
-import { useRouter } from 'vue-router' // 🌟 新增 router
+import { useRouter } from 'vue-router'
 
 const supabase = useSupabaseClient()
-const router = useRouter() // 🌟 宣告 router
+const router = useRouter()
 
 const content = ref('')
 const isSaving = ref(false)
@@ -59,26 +59,36 @@ const startNewRecord = () => {
 }
 
 // ==========================================
-// 🌟 新增：動態密碼驗證功能
+// 🌟 更新：動態密碼驗證與瀏覽器記憶功能
 // ==========================================
 const goToHistory = () => {
   const d = new Date()
   
-  // 取得西元年後兩碼 (例如 2026 -> "26")
+  // 取得西元年後兩碼、月、日並補零
   const yy = String(d.getFullYear()).slice(-2)
-  // 取得月份，並補零 (例如 7 -> "07")
   const mm = String(d.getMonth() + 1).padStart(2, '0')
-  // 取得日期，並補零 (例如 12 -> "12")
   const dd = String(d.getDate()).padStart(2, '0')
   
-  // 組合當日動態密碼 (例如 26071259)
-  const dynamicPassword = `${yy}${mm}${dd}59`
+  // 當日日期字串 (例如 "260917")
+  const dateStr = `${yy}${mm}${dd}`
+  // 組合當日動態密碼 (例如 "26091759")
+  const dynamicPassword = `${dateStr}59`
 
-  // 彈出輸入框 (乾淨無提示)
+  // 1. 檢查瀏覽器是否已經記錄了「今天」的驗證
+  const savedAuthDate = localStorage.getItem('history_auth_date')
+  
+  if (savedAuthDate === dateStr) {
+    // 若記錄的日期就是今天，免密碼直接放行
+    router.push('/history')
+    return
+  }
+
+  // 2. 如果今天還沒驗證過，彈出輸入框
   const userInput = prompt('請輸入密碼：')
   
   if (userInput === dynamicPassword) {
-    // 密碼正確，跳轉至歷史紀錄頁面
+    // 密碼正確，把「今天日期」存進瀏覽器，然後跳轉
+    localStorage.setItem('history_auth_date', dateStr)
     router.push('/history')
   } else if (userInput !== null) { 
     // 若使用者輸入錯誤 (且不是按取消)
@@ -124,6 +134,16 @@ const goToHistory = () => {
 
     <EvidenceUploader :currentDate="today" />
     
+    <!-- 🌟 新增：資料庫測試小入口 (放到底部) -->
+    <div class="mt-8 text-center pb-4">
+      <NuxtLink 
+        to="/test-db" 
+        class="text-xs text-gray-400 hover:text-blue-500 transition-colors flex items-center justify-center gap-1"
+      >
+        <span>🔧</span> 資料庫連線檢測
+      </NuxtLink>
+    </div>
+
   </div>
 </template>
 
