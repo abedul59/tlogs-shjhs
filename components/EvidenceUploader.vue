@@ -28,31 +28,38 @@ const formatRecordingTime = (timestamp) => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`
 }
 
-// 專門用來產生乾淨下載網址的函數 (避開 Vue 模板編譯錯誤)
 const getDownloadUrl = (messageId) => {
   if (!config.public.hfApiUrl) return '#'
-  
   const baseUrl = config.public.hfApiUrl.endsWith('/') 
     ? config.public.hfApiUrl.slice(0, -1) 
     : config.public.hfApiUrl
-    
   return `${baseUrl}/download/${messageId}`
 }
 
-const handleBatchUpload = async () => {
-  const files = fileInput.value?.files
+const handleBatchUpload = async (event) => {
+  // 🛡️ 第一道鎖：如果已經在執行中，嚴格阻擋任何重複點擊或事件觸發
+  if (isUploading.value !== false) {
+    console.warn('上傳程序進行中，阻擋重複觸發')
+    return
+  }
+
+  // 確保拿到檔案 (支援 event 或 ref)
+  const files = event.target?.files || fileInput.value?.files
   if (!files || files.length === 0) return
 
   isUploading.value = true
   uploadProgress.value = 0
   let successCount = 0
 
+  // 🛡️ 第二道鎖：記憶已經成功寫入資料庫的任務 ID
+  const safeInsertLock = new Set()
+
   try {
     const rawApiUrl = config.public.hfApiUrl
     if (!rawApiUrl) throw new Error('未設定 API 網址')
-    // 在 script 區塊使用正規表達式是安全的
     const hfApiUrl = rawApiUrl.replace(/\/$/, '')
 
+    // 依序處理每一個檔案 (避免 Render 記憶體一次被塞爆)
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       const recordTime = formatRecordingTime(file.lastModified)
@@ -61,10 +68,9 @@ const handleBatchUpload = async () => {
       const formData = new FormData()
       formData.append('file', file, newFilename)
 
-      // ==========================================
-      // 階段 1：將檔案上傳至 Render 暫存區，取得 task_id
-      // ==========================================
       isUploading.value = true
+      
+      // 階段 1：上傳到 Render
       const taskId = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest()
         xhr.open('POST', `${hfApiUrl}/upload/`)
@@ -92,50 +98,45 @@ const handleBatchUpload = async () => {
         xhr.send(formData)
       })
 
-      // ==========================================
-      // 階段 2：前端顯示「轉傳中」，並開始安全的非同步輪詢
-      // ==========================================
+      // 階段 2：前端安全輪詢
       isUploading.value = 'processing' 
-      
       let taskFinished = false
+      
       while (!taskFinished) {
         try {
           const res = await fetch(`${hfApiUrl}/status/${taskId}`)
           const data = await res.json()
 
           if (data.status === 'completed') {
-            taskFinished = true // 標記完成，結束迴圈
+            taskFinished = true 
             
-            // 成功拿到 TG 的資料，正式寫入 Supabase 資料庫
-            const { error } = await supabase.from('evidence_logs').insert({
-              log_date: props.currentDate,
-              title: newFilename.split('.')[0], 
-              telegram_url: data.telegram_link,
-              file_name: newFilename,
-              message_id: data.message_id 
-            })
-            
-            if (error) {
-              console.error('Supabase 寫入失敗:', error)
-            } else {
-              successCount++
+            // 🛡️ 終極防護：檢查這個任務是否已經存進資料庫過了？
+            if (!safeInsertLock.has(taskId)) {
+              safeInsertLock.add(taskId) // 立即上鎖
+              
+              // 確保沒寫入過，才真正呼叫 Supabase
+              const { error } = await supabase.from('evidence_logs').insert({
+                log_date: props.currentDate,
+                title: newFilename.split('.')[0], 
+                telegram_url: data.telegram_link,
+                file_name: newFilename,
+                message_id: data.message_id 
+              })
+              
+              if (error) console.error('Supabase 寫入失敗:', error)
+              else successCount++
             }
             
           } else if (data.status === 'failed') {
-            taskFinished = true // 標記完成，結束迴圈
+            taskFinished = true 
             throw new Error('伺服器轉傳 Telegram 失敗')
             
           } else {
-            // 若狀態為 pending 或 processing，等待 3 秒後再進行下一次詢問
+            // 尚未完成，乖乖等 3 秒再問
             await new Promise(resolve => setTimeout(resolve, 3000))
           }
         } catch (err) {
-          // 如果是伺服器明確回報失敗，直接往外層拋出，不要重試
-          if (err.message === '伺服器轉傳 Telegram 失敗') {
-            throw err
-          }
-          // 其他網路波動造成的異常，則等待 3 秒後自動重試
-          console.error('輪詢連線異常，將於 3 秒後自動重試', err)
+          if (err.message === '伺服器轉傳 Telegram 失敗') throw err
           await new Promise(resolve => setTimeout(resolve, 3000))
         }
       }
@@ -145,16 +146,16 @@ const handleBatchUpload = async () => {
       alert(`✅ 成功上傳並歸檔 ${successCount} 筆證據！`)
       fetchEvidence()
     } else {
-      alert('上傳失敗。')
+      alert('上傳發生問題，請檢查網路連線。')
     }
 
   } catch (err) {
     alert('上傳發生錯誤：\n' + err.message)
     console.error(err)
   } finally {
-    // 恢復初始狀態
     isUploading.value = false
     uploadProgress.value = 0
+    // 清空選取，確保不會觸發第二次
     if (fileInput.value) fileInput.value.value = ''
   }
 }
@@ -174,35 +175,32 @@ const deleteEvidence = async (id) => {
       </h2>
     </div>
 
-    <!-- 隱藏的檔案選擇器 -->
+    <!-- 🌟 加入了明確的 onClick 清空機制 -->
     <input 
       ref="fileInput" 
       type="file" 
       multiple 
       accept="audio/*,video/mp4" 
       class="hidden" 
+      @click="$event.target.value = null" 
       @change="handleBatchUpload" 
     />
 
-    <!-- 動態狀態按鈕 -->
     <button 
       @click="$refs.fileInput.click()"
       :disabled="isUploading !== false"
-      class="w-full py-3 mb-4 border-2 border-dashed border-blue-300 rounded-xl text-blue-600 font-medium hover:bg-blue-50 active:bg-blue-100 transition-colors"
+      class="w-full py-3 mb-4 border-2 border-dashed border-blue-300 rounded-xl text-blue-600 font-medium hover:bg-blue-50 active:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
     >
       <span v-if="isUploading === false">＋ 點擊選取手機錄音補傳 (可批次多選)</span>
       <span v-else-if="isUploading === true">正在傳送至伺服器 ({{ uploadProgress }}%)...</span>
       <span v-else-if="isUploading === 'processing'">☁️ 檔案已抵達，後台正轉存至 Telegram...</span>
     </button>
 
-    <!-- 證據列表 (三按鈕排版) -->
     <ul class="space-y-3">
       <li v-for="item in evidenceList" :key="item.id" class="flex flex-col bg-gray-50 p-3 rounded-lg border border-gray-200 gap-3">
         <span class="text-sm font-bold text-gray-800 break-all">{{ item.title }}</span>
         
         <div class="flex flex-wrap gap-2">
-          
-          <!-- 立即串流下載 (安全產生網址，避免無 message_id 時產生錯誤) -->
           <a 
             v-if="item.message_id"
             :href="getDownloadUrl(item.message_id)" 
@@ -211,8 +209,6 @@ const deleteEvidence = async (id) => {
           >
             ▶️ 立即串流下載🔗
           </a>
-
-          <!-- TG 原文連結 -->
           <a 
             :href="item.telegram_url" 
             target="_blank" 
@@ -220,15 +216,12 @@ const deleteEvidence = async (id) => {
           >
             ✈️ TG 原文
           </a>
-
-          <!-- 刪除按鈕 -->
           <button 
             @click="deleteEvidence(item.id)" 
             class="px-3 py-2 bg-red-100 text-red-600 rounded-lg text-xs font-bold hover:bg-red-200 shadow-sm whitespace-nowrap"
           >
             🗑️ 刪除
           </button>
-          
         </div>
       </li>
     </ul>
