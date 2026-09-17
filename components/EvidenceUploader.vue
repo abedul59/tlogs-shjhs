@@ -93,40 +93,52 @@ const handleBatchUpload = async () => {
       })
 
       // ==========================================
-      // 階段 2：前端顯示「轉傳中」，並開始輪詢任務進度
+      // 階段 2：前端顯示「轉傳中」，並開始安全的非同步輪詢
       // ==========================================
       isUploading.value = 'processing' 
       
-      await new Promise((resolve, reject) => {
-        const checkStatus = setInterval(async () => {
-          try {
-            const res = await fetch(`${hfApiUrl}/status/${taskId}`)
-            const data = await res.json()
+      let taskFinished = false
+      while (!taskFinished) {
+        try {
+          const res = await fetch(`${hfApiUrl}/status/${taskId}`)
+          const data = await res.json()
 
-            if (data.status === 'completed') {
-              clearInterval(checkStatus)
-              
-              // 成功拿到 TG 的資料，正式寫入 Supabase 資料庫
-              const { error } = await supabase.from('evidence_logs').insert({
-                log_date: props.currentDate,
-                title: newFilename.split('.')[0], 
-                telegram_url: data.telegram_link,
-                file_name: newFilename,
-                message_id: data.message_id 
-              })
-              
-              if (!error) successCount++
-              resolve()
-            } else if (data.status === 'failed') {
-              clearInterval(checkStatus)
-              reject(new Error('伺服器轉傳 Telegram 失敗'))
+          if (data.status === 'completed') {
+            taskFinished = true // 標記完成，結束迴圈
+            
+            // 成功拿到 TG 的資料，正式寫入 Supabase 資料庫
+            const { error } = await supabase.from('evidence_logs').insert({
+              log_date: props.currentDate,
+              title: newFilename.split('.')[0], 
+              telegram_url: data.telegram_link,
+              file_name: newFilename,
+              message_id: data.message_id 
+            })
+            
+            if (error) {
+              console.error('Supabase 寫入失敗:', error)
+            } else {
+              successCount++
             }
-            // 若狀態仍是 processing 或 pending，則不作處理，等待下一次詢問
-          } catch (err) {
-            console.error('輪詢失敗，將於 3 秒後自動重試', err)
+            
+          } else if (data.status === 'failed') {
+            taskFinished = true // 標記完成，結束迴圈
+            throw new Error('伺服器轉傳 Telegram 失敗')
+            
+          } else {
+            // 若狀態為 pending 或 processing，等待 3 秒後再進行下一次詢問
+            await new Promise(resolve => setTimeout(resolve, 3000))
           }
-        }, 3000) // 每 3 秒發送一次查詢
-      })
+        } catch (err) {
+          // 如果是伺服器明確回報失敗，直接往外層拋出，不要重試
+          if (err.message === '伺服器轉傳 Telegram 失敗') {
+            throw err
+          }
+          // 其他網路波動造成的異常，則等待 3 秒後自動重試
+          console.error('輪詢連線異常，將於 3 秒後自動重試', err)
+          await new Promise(resolve => setTimeout(resolve, 3000))
+        }
+      }
     }
 
     if (successCount > 0) {
