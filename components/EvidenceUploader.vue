@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 
 const props = defineProps({
   currentDate: { type: String, required: true }
@@ -8,9 +8,20 @@ const props = defineProps({
 const supabase = useSupabaseClient()
 const config = useRuntimeConfig()
 const fileInput = ref(null)
-const isUploading = ref(false) // false, true, 或 'processing'
+const isUploading = ref(false) // false, true, 'processing', 'retrying'
 const uploadProgress = ref(0)
 const evidenceList = ref([])
+
+// 🌟 設定伺服器清單 (自動讀取環境變數)
+const apiUrls = computed(() => {
+  const url1 = config.public.hfApiUrl ? config.public.hfApiUrl.replace(/\/$/, '') : ''
+  // 假設第二個 API 網址放在 hfApiUrl2
+  const url2 = config.public.hfApiUrl2 ? config.public.hfApiUrl2.replace(/\/$/, '') : ''
+  return [url1, url2].filter(url => url !== '')
+})
+
+// 綁定使用者目前選擇的優先伺服器 (0 或 1)
+const selectedApiIndex = ref(0)
 
 const fetchEvidence = async () => {
   const { data } = await supabase
@@ -29,124 +40,145 @@ const formatRecordingTime = (timestamp) => {
 }
 
 const getDownloadUrl = (messageId) => {
-  if (!config.public.hfApiUrl) return '#'
-  const baseUrl = config.public.hfApiUrl.endsWith('/') 
-    ? config.public.hfApiUrl.slice(0, -1) 
-    : config.public.hfApiUrl
-  return `${baseUrl}/download/${messageId}`
+  const currentApi = apiUrls.value[selectedApiIndex.value] || apiUrls.value[0] || '#'
+  return `${currentApi}/download/${messageId}`
 }
 
+// ==========================================
+// 🌟 核心模組：負責對「單一指定的 API」執行完整上傳與輪詢
+// ==========================================
+const uploadToServer = async (file, apiUrl, newFilename) => {
+  const formData = new FormData()
+  formData.append('file', file, newFilename)
+
+  uploadProgress.value = 0
+  
+  // 階段 1：上傳至指定的 Render 伺服器
+  const taskId = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${apiUrl}/upload/`)
+    
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        uploadProgress.value = Math.floor((e.loaded / e.total) * 100)
+      }
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const result = JSON.parse(xhr.responseText)
+          if (result.success) resolve(result.task_id)
+          else reject(new Error('伺服器拒絕產生任務'))
+        } catch (err) {
+          reject(new Error('伺服器回傳格式錯誤'))
+        }
+      } else {
+        reject(new Error(`上傳 Render 失敗: 狀態碼 ${xhr.status}`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('網路連線中斷'))
+    xhr.send(formData)
+  })
+
+  // 階段 2：前端安全輪詢
+  let taskFinished = false
+  while (!taskFinished) {
+    try {
+      const res = await fetch(`${apiUrl}/status/${taskId}`)
+      const data = await res.json()
+
+      if (data.status === 'completed') {
+        taskFinished = true 
+        return data // 成功，回傳 Telegram 資料
+      } else if (data.status === 'failed') {
+        taskFinished = true 
+        throw new Error('伺服器轉傳 Telegram 失敗')
+      } else {
+        await new Promise(resolve => setTimeout(resolve, 3000))
+      }
+    } catch (err) {
+      if (err.message === '伺服器轉傳 Telegram 失敗') throw err
+      await new Promise(resolve => setTimeout(resolve, 3000))
+    }
+  }
+}
+
+// ==========================================
+// 🌟 批次控制模組：處理檔案迴圈、失敗備援切換、寫入資料庫
+// ==========================================
 const handleBatchUpload = async (event) => {
-  // 🛡️ 第一道鎖：如果已經在執行中，嚴格阻擋任何重複點擊或事件觸發
   if (isUploading.value !== false) {
     console.warn('上傳程序進行中，阻擋重複觸發')
     return
   }
 
-  // 確保拿到檔案 (支援 event 或 ref)
   const files = event.target?.files || fileInput.value?.files
   if (!files || files.length === 0) return
 
-  isUploading.value = true
-  uploadProgress.value = 0
-  let successCount = 0
+  if (apiUrls.value.length === 0) {
+    alert('未設定任何 API 網址！')
+    return
+  }
 
-  // 🛡️ 第二道鎖：記憶已經成功寫入資料庫的任務 ID
+  let successCount = 0
   const safeInsertLock = new Set()
 
   try {
-    const rawApiUrl = config.public.hfApiUrl
-    if (!rawApiUrl) throw new Error('未設定 API 網址')
-    const hfApiUrl = rawApiUrl.replace(/\/$/, '')
-
-    // 依序處理每一個檔案 (避免 Render 記憶體一次被塞爆)
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       const recordTime = formatRecordingTime(file.lastModified)
       const newFilename = `${recordTime}_${file.name}`
-
-      const formData = new FormData()
-      formData.append('file', file, newFilename)
-
-      isUploading.value = true
       
-      // 階段 1：上傳到 Render
-      const taskId = await new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest()
-        xhr.open('POST', `${hfApiUrl}/upload/`)
+      // 決定主線路與備援線路
+      const primaryApi = apiUrls.value[selectedApiIndex.value]
+      const backupApi = apiUrls.value[selectedApiIndex.value === 0 ? 1 : 0] || primaryApi
+      
+      let tgData = null
+
+      // 🥊 第一次嘗試：使用使用者選擇的主線路
+      try {
+        isUploading.value = true
+        tgData = await uploadToServer(file, primaryApi, newFilename)
+      } catch (err) {
+        console.warn(`⚠️ 主線路 (${primaryApi}) 失敗，啟動備援機制...`, err)
         
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) {
-            uploadProgress.value = Math.floor((e.loaded / e.total) * 100)
+        // 🥊 第二次嘗試：若主線路失敗，且有設定第二台伺服器，自動切換
+        if (primaryApi !== backupApi) {
+          try {
+            isUploading.value = 'retrying' // 顯示重試狀態
+            tgData = await uploadToServer(file, backupApi, newFilename)
+          } catch (backupErr) {
+            console.error(`❌ 備援線路 (${backupApi}) 也失敗:`, backupErr)
+            throw new Error(`主線路與備援線路皆上傳失敗 (${file.name})`)
           }
-        }
-
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            try {
-              const result = JSON.parse(xhr.responseText)
-              if (result.success) resolve(result.task_id)
-              else reject(new Error('伺服器拒絕產生任務'))
-            } catch (err) {
-              reject(new Error('伺服器回傳格式錯誤'))
-            }
-          } else {
-            reject(new Error(`上傳 Render 失敗: 狀態碼 ${xhr.status}`))
-          }
-        }
-        xhr.onerror = () => reject(new Error('網路連線中斷'))
-        xhr.send(formData)
-      })
-
-      // 階段 2：前端安全輪詢
-      isUploading.value = 'processing' 
-      let taskFinished = false
-      
-      while (!taskFinished) {
-        try {
-          const res = await fetch(`${hfApiUrl}/status/${taskId}`)
-          const data = await res.json()
-
-          if (data.status === 'completed') {
-            taskFinished = true 
-            
-            // 🛡️ 終極防護：檢查這個任務是否已經存進資料庫過了？
-            if (!safeInsertLock.has(taskId)) {
-              safeInsertLock.add(taskId) // 立即上鎖
-              
-              // 確保沒寫入過，才真正呼叫 Supabase
-              const { error } = await supabase.from('evidence_logs').insert({
-                log_date: props.currentDate,
-                title: newFilename.split('.')[0], 
-                telegram_url: data.telegram_link,
-                file_name: newFilename,
-                message_id: data.message_id 
-              })
-              
-              if (error) console.error('Supabase 寫入失敗:', error)
-              else successCount++
-            }
-            
-          } else if (data.status === 'failed') {
-            taskFinished = true 
-            throw new Error('伺服器轉傳 Telegram 失敗')
-            
-          } else {
-            // 尚未完成，乖乖等 3 秒再問
-            await new Promise(resolve => setTimeout(resolve, 3000))
-          }
-        } catch (err) {
-          if (err.message === '伺服器轉傳 Telegram 失敗') throw err
-          await new Promise(resolve => setTimeout(resolve, 3000))
+        } else {
+          // 沒有備用線路可以切換，直接報錯
+          throw err 
         }
       }
-    }
+
+      // ✅ 兩條線路其中一條成功了，寫入資料庫
+      isUploading.value = 'processing'
+      if (tgData && !safeInsertLock.has(tgData.message_id)) {
+        safeInsertLock.add(tgData.message_id)
+        
+        const { error } = await supabase.from('evidence_logs').insert({
+          log_date: props.currentDate,
+          title: newFilename.split('.')[0], 
+          telegram_url: tgData.telegram_link,
+          file_name: newFilename,
+          message_id: tgData.message_id 
+        })
+        
+        if (error) console.error('Supabase 寫入失敗:', error)
+        else successCount++
+      }
+    } // 結束 for 迴圈
 
     if (successCount > 0) {
       alert(`✅ 成功上傳並歸檔 ${successCount} 筆證據！`)
       fetchEvidence()
-    } else {
-      alert('上傳發生問題，請檢查網路連線。')
     }
 
   } catch (err) {
@@ -155,8 +187,7 @@ const handleBatchUpload = async (event) => {
   } finally {
     isUploading.value = false
     uploadProgress.value = 0
-    // 清空選取，確保不會觸發第二次
-    if (fileInput.value) fileInput.value.value = ''
+    if (fileInput.value) fileInput.value.value = null
   }
 }
 
@@ -175,7 +206,21 @@ const deleteEvidence = async (id) => {
       </h2>
     </div>
 
-    <!-- 🌟 加入了明確的 onClick 清空機制 -->
+    <!-- 🌟 新增：伺服器選擇器 -->
+    <div class="mb-3 p-3 bg-blue-50 rounded-lg border border-blue-100">
+      <label class="block text-xs font-bold text-blue-800 mb-1">連線設定 (具備自動備援)</label>
+      <select 
+        v-model="selectedApiIndex" 
+        :disabled="isUploading !== false"
+        class="w-full p-2 rounded border border-blue-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-white"
+      >
+        <option :value="0">🌐 優先使用：伺服器 A (主機)</option>
+        <option :value="1" :disabled="apiUrls.length < 2">
+          {{ apiUrls.length < 2 ? '⚠️ 尚未設定伺服器 B' : '🌐 優先使用：伺服器 B (備用)' }}
+        </option>
+      </select>
+    </div>
+
     <input 
       ref="fileInput" 
       type="file" 
@@ -192,7 +237,8 @@ const deleteEvidence = async (id) => {
       class="w-full py-3 mb-4 border-2 border-dashed border-blue-300 rounded-xl text-blue-600 font-medium hover:bg-blue-50 active:bg-blue-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
     >
       <span v-if="isUploading === false">＋ 點擊選取手機錄音補傳 (可批次多選)</span>
-      <span v-else-if="isUploading === true">正在傳送至伺服器 ({{ uploadProgress }}%)...</span>
+      <span v-else-if="isUploading === true">正在傳送至優先伺服器 ({{ uploadProgress }}%)...</span>
+      <span v-else-if="isUploading === 'retrying'">⚠️ 切換至備用伺服器上傳 ({{ uploadProgress }}%)...</span>
       <span v-else-if="isUploading === 'processing'">☁️ 檔案已抵達，後台正轉存至 Telegram...</span>
     </button>
 
