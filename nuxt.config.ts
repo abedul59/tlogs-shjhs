@@ -6,7 +6,8 @@ export default defineNuxtConfig({
   ],
   runtimeConfig: {
     public: {
-      hfApiUrl: process.env.NUXT_PUBLIC_HF_API_URL
+      hfApiUrl: process.env.NUXT_PUBLIC_HF_API_URL,
+      hfApiUrl2: process.env.NUXT_PUBLIC_HF_API_URL_2,
     }
   },
   supabase: {
